@@ -16,5 +16,7 @@ services:
         sync: false
       - key: EXTERNAL_URL
         sync: false
+      - key: BOT_USERNAME
+        sync: false
       - key: PYTHON_VERSION
         value: 3.11.0

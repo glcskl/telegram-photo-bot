@@ -28,6 +28,9 @@ TELEGRAM_API = f"https://api.telegram.org/bot{TOKEN}"
 # URL сервиса для self-ping и авто-регистрации webhook (задаётся на Render)
 EXTERNAL_URL = os.getenv("EXTERNAL_URL", "").rstrip("/")
 
+# Имя бота для упоминаний в группах (без @)
+BOT_USERNAME = os.getenv("BOT_USERNAME", "ph_editot_bot")
+
 # Upstash Redis (REST API — подходит для serverless)
 REDIS_URL = os.getenv("REDIS_URL")
 REDIS_TOKEN = os.getenv("REDIS_TOKEN")
@@ -203,6 +206,31 @@ def webhook():
         msg = update["message"]
         chat_id = msg["chat"]["id"]
 
+        # В групповых чатах бот отвечает только на триггер «кот» или @упоминание
+        chat_type = msg.get("chat", {}).get("type", "private")
+        if chat_type in ("group", "supergroup"):
+            entity_mentions = [
+                ent.get("text", "")
+                for ent in msg.get("entities", [])
+                if ent.get("type") == "mention"
+            ]
+            lowercase_text = (
+                f"{msg.get('text', '')} {msg.get('caption', '')}".lower()
+            )
+            bot_mention = f"@{BOT_USERNAME}".lower()
+            triggered = (
+                "кот" in lowercase_text
+                or bot_mention in lowercase_text
+                or any(bot_mention in m.lower() for m in entity_mentions)
+            )
+            if not triggered:
+                return "OK"
+
+        # Команда /start — приветствие, только если не в группе (в группе нужен триггер)
+        if "text" in msg and msg["text"] == "/start":
+            tg_send_message(chat_id, "Привет! Отправь фото, я красиво оформлю заголовок.")
+            return "OK"
+
         # Обработка фото
         if "photo" in msg:
             photo = msg["photo"][-1]
@@ -242,10 +270,6 @@ def webhook():
                 f"Заголовок: **{title}**" + (f"\nПодзаголовок: {subtitle}" if subtitle else ""),
                 reply_markup=build_mode_keyboard(),
             )
-            return "OK"
-
-        if "text" in msg and msg["text"] == "/start":
-            tg_send_message(chat_id, "Привет! Отправь фото, я красиво оформлю заголовок.")
             return "OK"
 
     # Обработка нажатия кнопки
