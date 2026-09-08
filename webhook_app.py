@@ -210,6 +210,58 @@ def build_mode_keyboard():
     }
 
 
+# Готовые шаблоны: стиль + текст одним нажатием
+PRESETS = {
+    "discount": {
+        "label": "🔥 Скидка",
+        "mode": "banner",
+        "title": "Скидка до 50%",
+        "subtitle": "Только сегодня",
+    },
+    "sale": {
+        "label": "🛍 Распродажа",
+        "mode": "dark",
+        "title": "РАСПРОДАЖА",
+        "subtitle": "Всё по выгодным ценам",
+    },
+    "newyear": {
+        "label": "🎄 Новый год",
+        "mode": "blur",
+        "title": "С НОВЫМ ГОДОМ!",
+        "subtitle": "Пусть сбудутся мечты",
+    },
+    "fresh": {
+        "label": "✨ Новинка",
+        "mode": "dark",
+        "title": "НОВИНКА",
+        "subtitle": "Успей попробовать",
+    },
+    "hit": {
+        "label": "⭐ Хит продаж",
+        "mode": "banner",
+        "title": "ХИТ ПРОДАЖ",
+        "subtitle": "Лучший выбор покупателей",
+    },
+}
+
+
+def build_preset_keyboard():
+    buttons = [
+        {"text": p["label"], "callback_data": f"preset:{key}"}
+        for key, p in PRESETS.items()
+    ]
+    # По 2 кнопки в ряд
+    return {"inline_keyboard": [buttons[i : i + 2] for i in range(0, len(buttons), 2)]}
+
+
+# Стили обработки, используемые пресетами
+PRESET_PROCESSORS = {
+    "dark": process_dark_overlay,
+    "blur": process_blur_overlay,
+    "banner": process_banner,
+}
+
+
 def _is_supported_image(data: bytes) -> bool:
     """Проверка формата изображения по сигнатуре (JPEG/PNG/WebP)."""
     return (
@@ -324,7 +376,15 @@ def webhook():
             current.setdefault("active", True)
             current["photo"] = base64.b64encode(photo_bytes).decode()
             set_store(chat_id, current, user_id)
-            tg_send_message(chat_id, "Фото получено! Теперь напиши заголовок.\nМожно с подзаголовком через |")
+            tg_send_message(
+                chat_id,
+                "📸 Фото получено!\n\n"
+                "Выбери готовый шаблон кнопкой ниже,\n"
+                "или напиши свой заголовок.\n"
+                "С подзаголовком можно через |:\n"
+                "`Скидка 50% | Только сегодня`",
+                reply_markup=build_preset_keyboard(),
+            )
             return "OK"
 
         # Обработка текста (заголовок)
@@ -361,6 +421,34 @@ def webhook():
         cb_from = cq.get("from", {})
         user_id = cb_from.get("id")
         data = cq["data"]
+
+        # Заготовка по пресету — фото + текст из шаблона
+        if data.startswith("preset:"):
+            preset_key = data.split(":", 1)[1]
+            preset = PRESETS.get(preset_key)
+            if not preset:
+                tg_send_message(chat_id, "Такого шаблона нет.")
+                return "OK"
+            state = get_store(chat_id, user_id)
+            if not state or "photo" not in state:
+                tg_send_message(chat_id, "Начни заново: сначала пришли фото.")
+                return "OK"
+            photo_bytes = base64.b64decode(state["photo"])
+            processor = PRESET_PROCESSORS.get(preset["mode"])
+            try:
+                result = processor(photo_bytes, preset["title"], preset["subtitle"])
+                result.seek(0)
+                tg_send_photo(
+                    chat_id,
+                    result.read(),
+                    caption=f'Готово! Шаблон: {preset["label"]}',
+                )
+                clear_store(chat_id, user_id)
+            except Exception as e:
+                logging.exception("Ошибка обработки пресета")
+                tg_send_message(chat_id, f"Ошибка обработки: {e}")
+            return "OK"
+
         mode = data.split(":")[1]
 
         state = get_store(chat_id, user_id)
