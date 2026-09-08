@@ -205,26 +205,43 @@ def webhook():
     if "message" in update:
         msg = update["message"]
         chat_id = msg["chat"]["id"]
+        text_content = f"{msg.get('text', '')} {msg.get('caption', '')}"
 
-        # В групповых чатах бот отвечает только на триггер «кот» или @упоминание
+        # В групповых чатах бот работает по шаблону:
+        #  - ждёт триггер «кот» или @упоминание -> открывает сессию
+        #  - пока сессия активна — обрабатывает фото/заголовки
+        #  - после результата сессия закрывается, снова ждёт «кот»
         chat_type = msg.get("chat", {}).get("type", "private")
         if chat_type in ("group", "supergroup"):
-            entity_mentions = [
-                ent.get("text", "")
-                for ent in msg.get("entities", [])
-                if ent.get("type") == "mention"
-            ]
-            lowercase_text = (
-                f"{msg.get('text', '')} {msg.get('caption', '')}".lower()
-            )
+            is_private = False
             bot_mention = f"@{BOT_USERNAME}".lower()
+            lowercase_text = text_content.lower()
             triggered = (
-                "кот" in lowercase_text
-                or bot_mention in lowercase_text
-                or any(bot_mention in m.lower() for m in entity_mentions)
+                ("кот" in lowercase_text or bot_mention in lowercase_text)
+                or any(
+                    ent.get("type") == "mention"
+                    and bot_mention in msg.get("text", "")[ent.get("offset", 0): ent.get("offset", 0) + ent.get("length", 0)].lower()
+                    for ent in msg.get("entities", [])
+                )
             )
-            if not triggered:
+            state = get_store(chat_id)
+            session_active = bool(state and state.get("active"))
+
+            # Нет триггера и нет активной сессии -> молчим
+            if not session_active and not triggered:
                 return "OK"
+
+            # Триггер есть, сессия ещё не открыта -> открываем
+            if triggered and not session_active:
+                set_store(chat_id, {"active": True})
+                tg_send_message(chat_id, "Мяу! Пришли фото, я сделаю красивое оформление.")
+                return "OK"
+
+            # Сохраняем признак активной сессии в хранилище при каждом обновлении
+            state = state or {}
+            state.setdefault("active", True)
+        else:
+            is_private = True
 
         # Команда /start — приветствие, только если не в группе (в группе нужен триггер)
         if "text" in msg and msg["text"] == "/start":
@@ -240,7 +257,10 @@ def webhook():
             file_path = f["result"]["file_path"]
             photo_url = f"https://api.telegram.org/file/bot{TOKEN}/{file_path}"
             photo_bytes = requests.get(photo_url).content
-            set_store(chat_id, {"photo": base64.b64encode(photo_bytes).decode()})
+            current = get_store(chat_id) or {}
+            current.setdefault("active", True)
+            current["photo"] = base64.b64encode(photo_bytes).decode()
+            set_store(chat_id, current)
             tg_send_message(chat_id, "Фото получено! Теперь напиши заголовок.\nМожно с подзаголовком через |")
             return "OK"
 
