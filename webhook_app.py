@@ -196,30 +196,30 @@ def tg_send_photo(chat_id, photo_bytes, caption=""):
 
 # Опции настройки изображения
 FILTERS = {
-    "original": "✨ Оригинал",
-    "sepia": "🎞 Сепия",
-    "bw": "⚫️ Ч/Б",
-    "vintage": "📻 Винтаж",
-    "neon": "💡 Неон",
+    "original": "Оригинал",
+    "sepia": "Сепия",
+    "bw": "Ч/Б",
+    "vintage": "Винтаж",
+    "neon": "Неон",
 }
 FONTS = {
-    "mem": "🤣 Мем",
-    "official": "📜 Официальный",
-    "modern": "🅰️ Современный",
+    "mem": "Мем",
+    "official": "Официальный",
+    "modern": "Современный",
 }
 POSITIONS = {
-    "top": "⬆️ Сверху",
-    "center": "🎯 Центр",
-    "bottom": "⬇️ Снизу",
-    "meme": "🤡 Мем-стиль",
+    "top": "Сверху",
+    "center": "Центр",
+    "bottom": "Снизу",
+    "meme": "Мем-стиль",
 }
 
 
 def _keyboard(options: dict, prefix: str, current: str = "") -> dict:
-    """Строит inline-клавиатуру из словаря {ключ: подпись}, текущий выбор помечен ✓."""
+    """Строит inline-клавиатуру из словаря {ключ: подпись}, текущий выбор помечен галочкой."""
     buttons = []
     for key, label in options.items():
-        mark = " ✅" if key == current else ""
+        mark = " ✓" if key == current else ""
         buttons.append({"text": f"{label}{mark}", "callback_data": f"{prefix}:{key}"})
     return {"inline_keyboard": [buttons[i : i + 2] for i in range(0, len(buttons), 2)]}
 
@@ -229,11 +229,11 @@ def _nav_keyboard() -> dict:
     return {
         "inline_keyboard": [
             [
-                {"text": "🎨 Фильтр", "callback_data": "nav:filter"},
-                {"text": "🔤 Шрифт", "callback_data": "nav:font"},
-                {"text": "📐 Позиция", "callback_data": "nav:position"},
+                {"text": "Фильтр", "callback_data": "nav:filter"},
+                {"text": "Шрифт", "callback_data": "nav:font"},
+                {"text": "Позиция", "callback_data": "nav:position"},
             ],
-            [{"text": "✅ Сделать фото", "callback_data": "render"}],
+            [{"text": "Сделать фото", "callback_data": "render"}],
         ]
     }
 
@@ -246,14 +246,14 @@ def _settings_summary(state: dict) -> str:
     title = state.get("title", "")
     subtitle = state.get("subtitle", "")
     lines = [
-        f"🎨 Фильтр: {FILTERS.get(f, f)}",
-        f"🔤 Шрифт: {FONTS.get(fo, fo)}",
-        f"📐 Позиция: {POSITIONS.get(pos, pos)}",
+        f"Фильтр: {FILTERS.get(f, f)}",
+        f"Шрифт: {FONTS.get(fo, fo)}",
+        f"Позиция: {POSITIONS.get(pos, pos)}",
         "",
-        f"📝 Заголовок: {title}",
+        f"Заголовок: {title}",
     ]
     if subtitle:
-        lines.append(f"📝 Подзаголовок: {subtitle}")
+        lines.append(f"Подзаголовок: {subtitle}")
     return "\n".join(lines)
 
 
@@ -349,7 +349,7 @@ def webhook():
             # Триггер есть, сессия ещё не открыта -> открываем
             if triggered and not session_active:
                 set_store(chat_id, {"active": True}, user_id)
-                tg_send_message(chat_id, "Мяу! Пришли фото, я сделаю красивое оформление.")
+                tg_send_message(chat_id, "Пришли фото, я сделаю красивое оформление.")
                 return "OK"
 
             # Сохраняем признак активной сессии в хранилище при каждом обновлении
@@ -396,10 +396,10 @@ def webhook():
             set_store(chat_id, current, user_id)
             tg_send_message(
                 chat_id,
-                "📸 Фото получено!\n\n"
+                "Фото получено!\n\n"
                 "Теперь напиши заголовок.\n"
                 "С подзаголовком можно через |:\n"
-                "`Скидка 50% | Только сегодня`",
+                "`Название | Описание`",
             )
             return "OK"
 
@@ -458,7 +458,7 @@ def webhook():
                 tg_send_photo(
                     chat_id,
                     result.read(),
-                    caption="Готово! 🎉 Отправь фото снова, чтобы сделать ещё одно.",
+                    caption="Готово! Отправь фото снова, чтобы сделать ещё одно.",
                 )
                 clear_store(chat_id, user_id)
             except Exception as e:
