@@ -215,25 +215,66 @@ POSITIONS = {
 }
 
 
+def _keyboard(options: dict, prefix: str, current: str = "") -> dict:
+    """Строит inline-клавиатуру из словаря {ключ: подпись}, текущий выбор помечен ✓."""
+    buttons = []
+    for key, label in options.items():
+        mark = " ✅" if key == current else ""
+        buttons.append({"text": f"{label}{mark}", "callback_data": f"{prefix}:{key}"})
+    return {"inline_keyboard": [buttons[i : i + 2] for i in range(0, len(buttons), 2)]}
+
+
+def _nav_keyboard() -> dict:
+    """Кнопки навигации по шагам настройки."""
+    return {
+        "inline_keyboard": [
+            [
+                {"text": "🎨 Фильтр", "callback_data": "nav:filter"},
+                {"text": "🔤 Шрифт", "callback_data": "nav:font"},
+                {"text": "📐 Позиция", "callback_data": "nav:position"},
+            ],
+            [{"text": "✅ Сделать фото", "callback_data": "render"}],
+        ]
+    }
+
+
 def _settings_summary(state: dict) -> str:
     """Человекочитаемая сводка текущих настроек."""
     f = state.get("filter", "original")
     fo = state.get("font", "mem")
     pos = state.get("position", "center")
-    return (
-        f"🔥 Фильтр: {FILTERS.get(f, f)}\n"
-        f"🔤 Шрифт: {FONTS.get(fo, fo)}\n"
-        f"📐 Позиция: {POSITIONS.get(pos, pos)}"
-    )
-
-
-def _keyboard(options: dict, prefix: str) -> dict:
-    """Строит inline-клавиатуру из словаря {ключ: подпись}."""
-    buttons = [
-        {"text": label, "callback_data": f"{prefix}:{key}"}
-        for key, label in options.items()
+    title = state.get("title", "")
+    subtitle = state.get("subtitle", "")
+    lines = [
+        f"🎨 Фильтр: {FILTERS.get(f, f)}",
+        f"🔤 Шрифт: {FONTS.get(fo, fo)}",
+        f"📐 Позиция: {POSITIONS.get(pos, pos)}",
+        "",
+        f"📝 Заголовок: {title}",
     ]
-    return {"inline_keyboard": [buttons[i : i + 3] for i in range(0, len(buttons), 3)]}
+    if subtitle:
+        lines.append(f"📝 Подзаголовок: {subtitle}")
+    return "\n".join(lines)
+
+
+def _step_prompt(step: str, state: dict) -> tuple[str, dict]:
+    """Возвращает (текст, клавиатура) для запроса конкретного шага."""
+    if step == "filter":
+        return (
+            "Выбери фильтр:",
+            _keyboard(FILTERS, "filter", state.get("filter", "original")),
+        )
+    if step == "font":
+        return (
+            "Выбери шрифт:",
+            _keyboard(FONTS, "font", state.get("font", "mem")),
+        )
+    if step == "position":
+        return (
+            "Выбери расположение текста:",
+            _keyboard(POSITIONS, "position", state.get("position", "center")),
+        )
+    return "", {}
 
 
 def _is_supported_image(data: bytes) -> bool:
@@ -384,9 +425,9 @@ def webhook():
 
             tg_send_message(
                 chat_id,
-                f"Заголовок: **{title}**\n" + (f"Подзаголовок: {subtitle}\n" if subtitle else "") +
-                "\nТеперь выбери фильтр:",
-                reply_markup=_keyboard(FILTERS, "filter"),
+                f"{_settings_summary(state)}\n\n"
+                "Настрой как хочешь и жми «Сделать фото»:",
+                reply_markup=_nav_keyboard(),
             )
             return "OK"
 
@@ -403,48 +444,6 @@ def webhook():
             tg_send_message(chat_id, "Начни заново: сначала пришли фото.")
             return "OK"
 
-        try:
-            prefix, value = data.split(":", 1)
-        except ValueError:
-            return "OK"
-
-        # Шаг: выбор фильтра
-        if prefix == "filter" and value in FILTERS:
-            state["filter"] = value
-            set_store(chat_id, state, user_id)
-            tg_send_message(
-                chat_id,
-                f"Фильтр: {FILTERS[value]}\n\nТеперь выбери шрифт:",
-                reply_markup=_keyboard(FONTS, "font"),
-            )
-            return "OK"
-
-        # Шаг: выбор шрифта
-        if prefix == "font" and value in FONTS:
-            state["font"] = value
-            set_store(chat_id, state, user_id)
-            tg_send_message(
-                chat_id,
-                f"Шрифт: {FONTS[value]}\n\nТеперь выбери расположение текста:",
-                reply_markup=_keyboard(POSITIONS, "position"),
-            )
-            return "OK"
-
-        # Шаг: выбор позиции -> финальная сводка
-        if prefix == "position" and value in POSITIONS:
-            state["position"] = value
-            set_store(chat_id, state, user_id)
-            tg_send_message(
-                chat_id,
-                f"{_settings_summary(state)}\n\n"
-                f"Заголовок: **{state.get('title', '')}**\n"
-                f"{'Подзаголовок: ' + state.get('subtitle', '') if state.get('subtitle') else ''}\n\n"
-                "Готово? Сделать фото:",
-                reply_markup={"inline_keyboard": [[{"text": "✅ Сделать фото", "callback_data": "render"}] ]},
-            )
-            return "OK"
-
-        # Финальный рендер
         if data == "render":
             try:
                 result = process_image(
@@ -466,6 +465,34 @@ def webhook():
                 logging.exception("Ошибка обработки фото")
                 tg_send_message(chat_id, f"Ошибка обработки: {e}")
             return "OK"
+
+        # Навигация: показать выбор конкретного шага
+        if data.startswith("nav:"):
+            step = data.split(":", 1)[1]
+            text, kb = _step_prompt(step, state)
+            if text:
+                # Показываем сводку + запрос шага
+                tg_send_message(
+                    chat_id,
+                    f"{_settings_summary(state)}\n\n{text}",
+                    reply_markup=kb,
+                )
+            return "OK"
+
+        # Установка значения шага (filter/font/position) — возвращаемся к сводке
+        for prefix, options in (("filter", FILTERS), ("font", FONTS), ("position", POSITIONS)):
+            if data.startswith(f"{prefix}:"):
+                value = data.split(":", 1)[1]
+                if value in options:
+                    state[prefix] = value
+                    set_store(chat_id, state, user_id)
+                    tg_send_message(
+                        chat_id,
+                        f"{_settings_summary(state)}\n\n"
+                        "Настрой как хочешь и жми «Сделать фото»:",
+                        reply_markup=_nav_keyboard(),
+                    )
+                return "OK"
 
         return "OK"
 
