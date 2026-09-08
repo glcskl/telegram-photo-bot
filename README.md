@@ -1,6 +1,6 @@
 # Telegram Photo Bot
 
-Бот для красивого оформления фото с текстом.
+Бот для красивого оформления фото с текстом. Работает 24/7 на бесплатном тарифе Render с keep-alive механизмом (не засыпает).
 
 ## Режимы
 
@@ -8,16 +8,30 @@
 - **Блюр** — размытый фон + чёткий текст по центру
 - **Баннер** — фото как фон + полупрозрачный блок снизу с текстом
 
-## Запуск
+## Как не засыпает
 
-```bash
-cd telegram-photo-bot
-python3 -m venv venv
-source venv/bin/activate
-pip install -r requirements.txt
-export BOT_TOKEN="твой_токен_от_BotFather"
-python bot.py
-```
+На бесплатном тарифе Render засыпает сервис через 15 минут неактивности. Решено 2 уровнями защиты:
+
+1. **Встроенный self-ping** — `webhook_app.py` запускает фоновый поток, который каждые 10 минут пингует `/health`, не давая Render усыпить сервис. Также автоматически регистрирует webhook при старте.
+2. **UptimeRobot** (рекомендуется) — внешний мониторинг каждые 5 минут на `https://your-bot.onrender.com/health`.
+
+## Деплой на Render
+
+1. Пуш репозитория в GitHub: `https://github.com/glcskl/telegram-photo-bot`
+2. На https://render.com → New → Blueprint (позволяет деплой по `render.yaml`) и укажи репозиторий.
+   - Или: New → Web Service → подключи репозиторий.
+3. Задай Environment Variables:
+   - `BOT_TOKEN` — токен от @BotFather
+   - `REDIS_URL` — `https://<db>.upstash.io`
+   - `REDIS_TOKEN` — токен Upstash
+   - `EXTERNAL_URL` — `https://<имя>.onrender.com` (URL сервиса, без слеша в конце)
+4. Деплой. Self-ping сам зарегистрирует webhook.
+
+## Технологии
+
+- Flask + gunicorn (webhook, не polling)
+- Pillow (обработка фото)
+- Upstash Redis (хранение состояний между шагами)
 
 ## Использование
 

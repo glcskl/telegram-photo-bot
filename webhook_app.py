@@ -2,11 +2,13 @@ import os
 import base64
 import json
 import logging
+import threading
+import time
 from urllib.request import Request, urlopen
 
 import requests
 from dotenv import load_dotenv
-from flask import Flask, request
+from flask import Flask, request, jsonify
 
 from image_processor import (
     process_dark_overlay,
@@ -18,34 +20,93 @@ load_dotenv()
 app = Flask(__name__)
 
 TOKEN = os.getenv("BOT_TOKEN")
+if not TOKEN:
+    raise RuntimeError("Нет BOT_TOKEN. Задай переменную окружения BOT_TOKEN.")
+
 TELEGRAM_API = f"https://api.telegram.org/bot{TOKEN}"
+
+# URL сервиса для self-ping и авто-регистрации webhook (задаётся на Render)
+EXTERNAL_URL = os.getenv("EXTERNAL_URL", "").rstrip("/")
 
 # Upstash Redis (REST API — подходит для serverless)
 REDIS_URL = os.getenv("REDIS_URL")
 REDIS_TOKEN = os.getenv("REDIS_TOKEN")
 
 
-def redis_set(key, value, ttl=None):
-    """Сохранить значение в Upstash Redis."""
-    endpoint = f"{REDIS_URL}/set/{key}?value=upstash_placeholder"
-    # Upstash REST API: значение передаётся в теле, токен в URL path
-    if ttl:
-        endpoint += f"&EX={ttl}"
+# ============================================
+# SELF-PING MECHANISM (предотвращает засыпание)
+# ============================================
+def _tg_request(method, payload):
+    resp = requests.post(f"{TELEGRAM_API}/{method}", json=payload, timeout=15)
+    return resp.json()
+
+
+def register_webhook():
+    """Автоматически регистрирует webhook при старте на Render."""
+    webhook_url = f"{EXTERNAL_URL}/webhook/{TOKEN}"
     try:
-        # Записываем через POST с JSON телом
-        req = Request(
-            endpoint,
-            method="POST",
-            headers={"Content-Type": "application/json"},
-            data=json.dumps({"value" if False else "value": value}).encode(),
+        result = _tg_request(
+            "setWebhook",
+            {
+                "url": webhook_url,
+                "allowed_updates": ["message", "callback_query"],
+                "drop_pending_updates": True,
+            },
         )
+        if result.get("ok"):
+            logging.info(f"[Webhook] Зарегистрирован: {webhook_url}")
+        else:
+            logging.error(f"[Webhook] Ошибка: {result.get('description')}")
+    except Exception as e:
+        logging.error(f"[Webhook] Ошибка: {e}")
+
+
+def self_ping_worker():
+    """Фоновый поток: каждые 10 минут пингует себя, чтобы Render не засыпал."""
+    time.sleep(10)
+    if EXTERNAL_URL:
+        register_webhook()
+
+    time.sleep(30)
+    while True:
+        try:
+            if EXTERNAL_URL:
+                resp = requests.get(f"{EXTERNAL_URL}/health", timeout=30)
+                logging.info(
+                    f"[Keep-Alive] Self-ping: {resp.status_code}"
+                    if resp.status_code == 200
+                    else f"[Keep-Alive] Self-ping статус: {resp.status_code}"
+                )
+        except Exception as e:
+            logging.error(f"[Keep-Alive] Ошибка self-ping: {e}")
+        time.sleep(600)
+
+
+if EXTERNAL_URL:
+    ping_thread = threading.Thread(target=self_ping_worker, daemon=True)
+    ping_thread.start()
+    logging.info(f"[Keep-Alive] Запущен self-ping для {EXTERNAL_URL}")
+
+
+def redis_setex(key, value, ttl):
+    """Сохранить значение с TTL (сек) в Upstash Redis."""
+    # SETEX key seconds value: команда в URL, значение как тело POST
+    # POST url/setex/key/ttl   body=value
+    endpoint = f"{REDIS_URL}/setex/{key}/{ttl}"
+    req = Request(
+        endpoint,
+        method="POST",
+        headers={"Authorization": f"Bearer {REDIS_TOKEN}"},
+        data=value.encode("utf-8"),
+    )
+    try:
         urlopen(req, timeout=10)
     except Exception as e:
-        logging.error(f"Redis set error: {e}")
+        logging.error(f"Redis setex error: {e}")
 
 
 def redis_get(key):
-    """Получить значение из Upstash Redis."""
+    """Получить значение из Upstash Redis. GET url/key"""
     req = Request(
         f"{REDIS_URL}/get/{key}",
         headers={"Authorization": f"Bearer {REDIS_TOKEN}"},
@@ -53,7 +114,6 @@ def redis_get(key):
     try:
         resp = urlopen(req, timeout=10)
         body = json.loads(resp.read().decode())
-        # Формат Upstash: {"result": value} или {"result": null}
         return body.get("result")
     except Exception as e:
         logging.error(f"Redis get error: {e}")
@@ -61,7 +121,7 @@ def redis_get(key):
 
 
 def redis_del(key):
-    """Удалить ключ из Upstash Redis."""
+    """Удалить ключ из Upstash Redis. POST url/del/key"""
     req = Request(
         f"{REDIS_URL}/del/{key}",
         method="POST",
@@ -83,7 +143,7 @@ def get_store(chat_id):
 
 def set_store(chat_id, data):
     """Сохранить данные пользователя в Redis (TTL 1 час)."""
-    redis_set(f"user:{chat_id}", json.dumps(data, ensure_ascii=False), ttl=3600)
+    redis_setex(f"user:{chat_id}", json.dumps(data, ensure_ascii=False), ttl=3600)
 
 
 def clear_store(chat_id):
@@ -118,8 +178,19 @@ def build_mode_keyboard():
 
 
 @app.route("/", methods=["GET"])
-def health():
+def root():
     return "OK", 200
+
+
+@app.route("/health", methods=["GET"])
+def health():
+    return jsonify(
+        {
+            "status": "ok",
+            "service": "telegram-photo-bot",
+            "self_ping_enabled": bool(EXTERNAL_URL),
+        }
+    ), 200
 
 
 @app.route(f"/webhook/{TOKEN}", methods=["POST"])
