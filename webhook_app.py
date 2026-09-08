@@ -10,11 +10,7 @@ import requests
 from dotenv import load_dotenv
 from flask import Flask, request, jsonify
 
-from image_processor import (
-    process_dark_overlay,
-    process_blur_overlay,
-    process_banner,
-)
+from image_processor import process_image
 
 load_dotenv()
 app = Flask(__name__)
@@ -198,68 +194,46 @@ def tg_send_photo(chat_id, photo_bytes, caption=""):
         return None
 
 
-def build_mode_keyboard():
-    return {
-        "inline_keyboard": [
-            [
-                {"text": "Затемнение", "callback_data": "mode:dark"},
-                {"text": "Блюр", "callback_data": "mode:blur"},
-                {"text": "Баннер", "callback_data": "mode:banner"},
-            ]
-        ]
-    }
-
-
-# Готовые шаблоны: стиль + текст одним нажатием
-PRESETS = {
-    "discount": {
-        "label": "🔥 Скидка",
-        "mode": "banner",
-        "title": "Скидка до 50%",
-        "subtitle": "Только сегодня",
-    },
-    "sale": {
-        "label": "🛍 Распродажа",
-        "mode": "dark",
-        "title": "РАСПРОДАЖА",
-        "subtitle": "Всё по выгодным ценам",
-    },
-    "newyear": {
-        "label": "🎄 Новый год",
-        "mode": "blur",
-        "title": "С НОВЫМ ГОДОМ!",
-        "subtitle": "Пусть сбудутся мечты",
-    },
-    "fresh": {
-        "label": "✨ Новинка",
-        "mode": "dark",
-        "title": "НОВИНКА",
-        "subtitle": "Успей попробовать",
-    },
-    "hit": {
-        "label": "⭐ Хит продаж",
-        "mode": "banner",
-        "title": "ХИТ ПРОДАЖ",
-        "subtitle": "Лучший выбор покупателей",
-    },
+# Опции настройки изображения
+FILTERS = {
+    "original": "✨ Оригинал",
+    "sepia": "🎞 Сепия",
+    "bw": "⚫️ Ч/Б",
+    "vintage": "📻 Винтаж",
+    "neon": "💡 Неон",
+}
+FONTS = {
+    "mem": "🤣 Мем",
+    "official": "📜 Официальный",
+    "modern": "🅰️ Современный",
+}
+POSITIONS = {
+    "top": "⬆️ Сверху",
+    "center": "🎯 Центр",
+    "bottom": "⬇️ Снизу",
+    "meme": "🤡 Мем-стиль",
 }
 
 
-def build_preset_keyboard():
+def _settings_summary(state: dict) -> str:
+    """Человекочитаемая сводка текущих настроек."""
+    f = state.get("filter", "original")
+    fo = state.get("font", "mem")
+    pos = state.get("position", "center")
+    return (
+        f"🔥 Фильтр: {FILTERS.get(f, f)}\n"
+        f"🔤 Шрифт: {FONTS.get(fo, fo)}\n"
+        f"📐 Позиция: {POSITIONS.get(pos, pos)}"
+    )
+
+
+def _keyboard(options: dict, prefix: str) -> dict:
+    """Строит inline-клавиатуру из словаря {ключ: подпись}."""
     buttons = [
-        {"text": p["label"], "callback_data": f"preset:{key}"}
-        for key, p in PRESETS.items()
+        {"text": label, "callback_data": f"{prefix}:{key}"}
+        for key, label in options.items()
     ]
-    # По 2 кнопки в ряд
-    return {"inline_keyboard": [buttons[i : i + 2] for i in range(0, len(buttons), 2)]}
-
-
-# Стили обработки, используемые пресетами
-PRESET_PROCESSORS = {
-    "dark": process_dark_overlay,
-    "blur": process_blur_overlay,
-    "banner": process_banner,
-}
+    return {"inline_keyboard": [buttons[i : i + 3] for i in range(0, len(buttons), 3)]}
 
 
 def _is_supported_image(data: bytes) -> bool:
@@ -375,15 +349,16 @@ def webhook():
             current = get_store(chat_id, user_id) or {}
             current.setdefault("active", True)
             current["photo"] = base64.b64encode(photo_bytes).decode()
+            current.setdefault("filter", "original")
+            current.setdefault("font", "mem")
+            current.setdefault("position", "center")
             set_store(chat_id, current, user_id)
             tg_send_message(
                 chat_id,
                 "📸 Фото получено!\n\n"
-                "Выбери готовый шаблон кнопкой ниже,\n"
-                "или напиши свой заголовок.\n"
+                "Теперь напиши заголовок.\n"
                 "С подзаголовком можно через |:\n"
                 "`Скидка 50% | Только сегодня`",
-                reply_markup=build_preset_keyboard(),
             )
             return "OK"
 
@@ -409,8 +384,9 @@ def webhook():
 
             tg_send_message(
                 chat_id,
-                f"Заголовок: **{title}**" + (f"\nПодзаголовок: {subtitle}" if subtitle else ""),
-                reply_markup=build_mode_keyboard(),
+                f"Заголовок: **{title}**\n" + (f"Подзаголовок: {subtitle}\n" if subtitle else "") +
+                "\nТеперь выбери фильтр:",
+                reply_markup=_keyboard(FILTERS, "filter"),
             )
             return "OK"
 
@@ -422,59 +398,74 @@ def webhook():
         user_id = cb_from.get("id")
         data = cq["data"]
 
-        # Заготовка по пресету — фото + текст из шаблона
-        if data.startswith("preset:"):
-            preset_key = data.split(":", 1)[1]
-            preset = PRESETS.get(preset_key)
-            if not preset:
-                tg_send_message(chat_id, "Такого шаблона нет.")
-                return "OK"
-            state = get_store(chat_id, user_id)
-            if not state or "photo" not in state:
-                tg_send_message(chat_id, "Начни заново: сначала пришли фото.")
-                return "OK"
-            photo_bytes = base64.b64decode(state["photo"])
-            processor = PRESET_PROCESSORS.get(preset["mode"])
+        state = get_store(chat_id, user_id)
+        if not state or "photo" not in state:
+            tg_send_message(chat_id, "Начни заново: сначала пришли фото.")
+            return "OK"
+
+        try:
+            prefix, value = data.split(":", 1)
+        except ValueError:
+            return "OK"
+
+        # Шаг: выбор фильтра
+        if prefix == "filter" and value in FILTERS:
+            state["filter"] = value
+            set_store(chat_id, state, user_id)
+            tg_send_message(
+                chat_id,
+                f"Фильтр: {FILTERS[value]}\n\nТеперь выбери шрифт:",
+                reply_markup=_keyboard(FONTS, "font"),
+            )
+            return "OK"
+
+        # Шаг: выбор шрифта
+        if prefix == "font" and value in FONTS:
+            state["font"] = value
+            set_store(chat_id, state, user_id)
+            tg_send_message(
+                chat_id,
+                f"Шрифт: {FONTS[value]}\n\nТеперь выбери расположение текста:",
+                reply_markup=_keyboard(POSITIONS, "position"),
+            )
+            return "OK"
+
+        # Шаг: выбор позиции -> финальная сводка
+        if prefix == "position" and value in POSITIONS:
+            state["position"] = value
+            set_store(chat_id, state, user_id)
+            tg_send_message(
+                chat_id,
+                f"{_settings_summary(state)}\n\n"
+                f"Заголовок: **{state.get('title', '')}**\n"
+                f"{'Подзаголовок: ' + state.get('subtitle', '') if state.get('subtitle') else ''}\n\n"
+                "Готово? Сделать фото:",
+                reply_markup={"inline_keyboard": [[{"text": "✅ Сделать фото", "callback_data": "render"}] ]},
+            )
+            return "OK"
+
+        # Финальный рендер
+        if data == "render":
             try:
-                result = processor(photo_bytes, preset["title"], preset["subtitle"])
+                result = process_image(
+                    base64.b64decode(state["photo"]),
+                    state.get("title", ""),
+                    state.get("subtitle", ""),
+                    filter_name=state.get("filter", "original"),
+                    font_style=state.get("font", "mem"),
+                    position=state.get("position", "center"),
+                )
                 result.seek(0)
                 tg_send_photo(
                     chat_id,
                     result.read(),
-                    caption=f'Готово! Шаблон: {preset["label"]}',
+                    caption="Готово! 🎉 Отправь фото снова, чтобы сделать ещё одно.",
                 )
                 clear_store(chat_id, user_id)
             except Exception as e:
-                logging.exception("Ошибка обработки пресета")
+                logging.exception("Ошибка обработки фото")
                 tg_send_message(chat_id, f"Ошибка обработки: {e}")
             return "OK"
-
-        mode = data.split(":")[1]
-
-        state = get_store(chat_id, user_id)
-        if not state or "photo" not in state:
-            tg_send_message(chat_id, "Что-то пошло не так. Начни заново с фото.")
-            return "OK"
-
-        photo_bytes = base64.b64decode(state["photo"])
-        title = state.get("title", "")
-        subtitle = state.get("subtitle", "")
-
-        processors = {
-            "dark": process_dark_overlay,
-            "blur": process_blur_overlay,
-            "banner": process_banner,
-        }
-
-        try:
-            processor = processors.get(mode)
-            result = processor(photo_bytes, title, subtitle)
-            result.seek(0)
-            tg_send_photo(chat_id, result.read(), caption=f"Готово! Стиль: {mode}")
-            clear_store(chat_id, user_id)
-        except Exception as e:
-            logging.exception("Ошибка обработки фото")
-            tg_send_message(chat_id, f"Ошибка обработки: {e}")
 
         return "OK"
 
