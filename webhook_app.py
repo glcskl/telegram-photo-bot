@@ -1,7 +1,9 @@
 import os
 import base64
+import io
 import json
 import logging
+import random
 import threading
 import time
 from urllib.request import Request, urlopen
@@ -9,6 +11,7 @@ from urllib.request import Request, urlopen
 import requests
 from dotenv import load_dotenv
 from flask import Flask, request, jsonify
+from PIL import Image
 
 from image_processor import process_image
 
@@ -178,11 +181,14 @@ def tg_send_message(chat_id, text, reply_markup=None):
     return tg_request("sendMessage", payload)
 
 
-def tg_send_photo(chat_id, photo_bytes, caption=""):
+def tg_send_photo(chat_id, photo_bytes, caption="", reply_markup=None):
     try:
+        payload = {"chat_id": chat_id, "caption": caption}
+        if reply_markup:
+            payload["reply_markup"] = json.dumps(reply_markup)
         resp = requests.post(
             f"{TELEGRAM_API}/sendPhoto",
-            data={"chat_id": chat_id, "caption": caption},
+            data=payload,
             files={"photo": ("photo.jpg", photo_bytes, "image/jpeg")},
         )
         result = resp.json()
@@ -192,6 +198,11 @@ def tg_send_photo(chat_id, photo_bytes, caption=""):
     except Exception as e:
         logging.error(f"[TG:sendPhoto] exception: {e}")
         return None
+
+
+def tg_delete_message(chat_id, message_id):
+    """Удаляет сообщение (используется для замены старых рендеров)."""
+    return tg_request("deleteMessage", {"chat_id": chat_id, "message_id": message_id})
 
 
 def tg_edit_message(chat_id, message_id, text=None, reply_markup=None):
@@ -249,6 +260,106 @@ POSITIONS = {
     "bottom": "Снизу",
     "meme": "Мем-стиль",
 }
+FRAMES = {
+    "none": "Без рамки",
+    "polaroid": "Поляроид",
+    "meme_frame": "Мем-рамка",
+    "gradient": "Градиент",
+    "vignette": "Виньетка",
+}
+TEXT_STYLES = {
+    "outline": "Обводка",
+    "shadow": "Тень",
+    "plate": "Плашка",
+    "auto": "Авто-цвет",
+}
+DEFAULTS = {
+    "filter": "original",
+    "font": "mem",
+    "position": "center",
+    "frame": "none",
+    "tstyle": "outline",
+}
+
+
+# ============================================
+# ПЕРЕГЕНЕРАЦИЯ И ВСПОМОГАТЕЛЬНОЕ
+# ============================================
+def _compress_photo(data: bytes) -> bytes:
+    """Сжимает большие фото (лимит Telegram 20МБ)."""
+    img = Image.open(io.BytesIO(data)).convert("RGB")
+    img.thumbnail((4096, 4096), Image.LANCZOS)
+    buf = io.BytesIO()
+    img.save(buf, format="JPEG", quality=88)
+    buf.seek(0)
+    return buf.read()
+
+
+def _render_kb() -> dict:
+    return {
+        "inline_keyboard": [
+            [
+                {"text": "Другой вариант", "callback_data": "reroll"},
+                {"text": "Случайный стиль", "callback_data": "random"},
+            ],
+            [{"text": "Сохранить", "callback_data": "keep"}],
+        ]
+    }
+
+
+def _combo_at(idx: int) -> dict:
+    """Комбинация настроек по индексу (циклический перебор)."""
+    pools = {
+        "filter": list(FILTERS),
+        "frame": list(FRAMES),
+        "font": list(FONTS),
+        "position": list(POSITIONS),
+        "tstyle": list(TEXT_STYLES),
+    }
+    combo = {}
+    for k in ("filter", "frame", "font", "position", "tstyle"):
+        combo[k] = pools[k][idx % len(pools[k])]
+        idx //= len(pools[k])
+    return combo
+
+
+def _random_combo() -> dict:
+    return {
+        "filter": random.choice(list(FILTERS)),
+        "frame": random.choice(list(FRAMES)),
+        "font": random.choice(list(FONTS)),
+        "position": random.choice(list(POSITIONS)),
+        "tstyle": random.choice(list(TEXT_STYLES)),
+    }
+
+
+def _render_and_send(chat_id, user_id, state) -> dict:
+    """Рендерит фото по текущим настройкам и шлёт с кнопками перегенерации."""
+    result = process_image(
+        base64.b64decode(state["photo"]),
+        state.get("title", "") if not state.get("text_none") else "",
+        state.get("subtitle", "") if not state.get("text_none") else "",
+        filter_name=state.get("filter", "original"),
+        font_style=state.get("font", "mem"),
+        position=state.get("position", "center"),
+        frame=state.get("frame", "none"),
+        text_style=state.get("tstyle", "outline"),
+    )
+    result.seek(0)
+    old = state.get("sent_msg_id")
+    if old:
+        tg_delete_message(chat_id, old)
+    res = tg_send_photo(
+        chat_id,
+        result.read(),
+        caption="Фото готово. Можно сделать другой вариант или сохранить:",
+        reply_markup=_render_kb(),
+    )
+    if res and res.get("ok") and res["result"].get("message_id"):
+        state["sent_msg_id"] = res["result"]["message_id"]
+        state["rendered"] = True
+        set_store(chat_id, state, user_id)
+    return state
 
 
 def _option_row(options: dict, prefix: str, current: str) -> list:
@@ -290,6 +401,10 @@ def _settings_line(state: dict) -> str:
     )
 
 
+def _frame_line(state: dict) -> str:
+    return f"{FRAMES.get(state.get('frame', 'none'))} | {TEXT_STYLES.get(state.get('tstyle', 'outline'))}"
+
+
 def _help_text(is_group: bool) -> str:
     """Справка про бота для режима чата (группа или ЛС)."""
     base = (
@@ -303,8 +418,13 @@ def _help_text(is_group: bool) -> str:
         "   - Фильтры: Оригинал, Сепия, Ч/Б, Винтаж, Неон\n"
         "   - Шрифты: Мем, Официальный, Современный\n"
         "   - Позиция: Сверху, Центр, Снизу, Мем-стиль\n"
+        "   - Рамка: Поляроид, Мем-рамка, Градиент, Виньетка\n"
+        "   - Стиль текста: Обводка, Тень, Плашка, Авто-цвет\n"
         "   - Текст: изменить или убрать текст\n"
+        "   - Случайный стиль: красивая связка одной кнопкой\n"
         "4. Нажми «Готово» — получишь фото\n\n"
+        "После результата можно нажать «Другой вариант» — бот\n"
+        "переберёт стили по кругу. «Оставить» — сохранить.\n\n"
     )
     if is_group:
         return (
@@ -329,7 +449,8 @@ def _panel_view(state: dict, view: str, is_group: bool) -> tuple[str, dict]:
         text = (
             "Настройки.\n\n"
             f"Текст: {_text_line(state)}\n"
-            f"{_settings_line(state)}\n\n"
+            f"{_settings_line(state)}\n"
+            f"Рамка/стиль: {_frame_line(state)}\n\n"
             "Выбери раздел для настройки или жми «Готово»:"
         )
         kb = {
@@ -343,21 +464,34 @@ def _panel_view(state: dict, view: str, is_group: bool) -> tuple[str, dict]:
                     {"text": "Позиция", "callback_data": "view:position"},
                 ],
                 [
-                    {"text": "Хелп", "callback_data": "view:help"},
-                    {"text": "Готово", "callback_data": "render"},
+                    {"text": "Рамка", "callback_data": "view:frame"},
+                    {"text": "Стиль текста", "callback_data": "view:tstyle"},
                 ],
+                [
+                    {"text": "Случайный стиль", "callback_data": "random"},
+                    {"text": "Хелп", "callback_data": "view:help"},
+                ],
+                [{"text": "Готово", "callback_data": "render"}],
             ]
         }
         return text, kb
 
-    if view in ("filter", "font", "position"):
-        options = {"filter": FILTERS, "font": FONTS, "position": POSITIONS}[view]
+    if view in ("filter", "font", "position", "frame", "tstyle"):
+        options = {
+            "filter": FILTERS,
+            "font": FONTS,
+            "position": POSITIONS,
+            "frame": FRAMES,
+            "tstyle": TEXT_STYLES,
+        }[view]
         labels = {
             "filter": "Фильтр",
             "font": "Шрифт",
             "position": "Позиция текста",
+            "frame": "Рамка",
+            "tstyle": "Стиль текста",
         }
-        cur = state.get(view, {"filter": "original", "font": "mem", "position": "center"}[view])
+        cur = state.get(view, DEFAULTS[view])
         text = (
             f"Раздел: {labels[view]}\n\n"
             f"Текущий: {options.get(cur, cur)}\n"
@@ -386,11 +520,6 @@ def _panel_view(state: dict, view: str, is_group: bool) -> tuple[str, dict]:
         ]
     }
     return text, kb
-
-
-def _settings_summary(state: dict) -> str:
-    """Краткая сводка для подписи результата."""
-    return _settings_line(state)
 
 
 def _is_supported_image(data: bytes) -> bool:
@@ -506,9 +635,13 @@ def webhook():
                 return "OK"
             photo_url = f"https://api.telegram.org/file/bot{TOKEN}/{file_path}"
             photo_bytes = requests.get(photo_url).content
+            # Большие фото сжимаем, а не отклоняем
             if len(photo_bytes) > 20 * 1024 * 1024:
-                tg_send_message(chat_id, "Фото слишком большое (лимит 20 МБ).")
-                return "OK"
+                try:
+                    photo_bytes = _compress_photo(photo_bytes)
+                except Exception:
+                    tg_send_message(chat_id, "Не удалось обработать фото. Попробуй другое.")
+                    return "OK"
             # Валидация: это должно быть изображение JPEG/PNG/WebP
             if not _is_supported_image(photo_bytes):
                 tg_send_message(chat_id, "Это не похоже на изображение (JPEG/PNG/WebP). Попробуй другое фото.")
@@ -516,10 +649,11 @@ def webhook():
             current = get_store(chat_id, user_id) or {}
             current.setdefault("active", True)
             current["photo"] = base64.b64encode(photo_bytes).decode()
-            current.setdefault("filter", "original")
-            current.setdefault("font", "mem")
-            current.setdefault("position", "center")
+            for k, v in DEFAULTS.items():
+                current.setdefault(k, v)
             current["panel_msg_id"] = None
+            current["sent_msg_id"] = None
+            current["rendered"] = False
             current["text_mode"] = "initial"
             current["text_none"] = False
             set_store(chat_id, current, user_id)
@@ -579,24 +713,46 @@ def webhook():
 
         if data == "render":
             try:
-                result = process_image(
-                    base64.b64decode(state["photo"]),
-                    state.get("title", "") if not state.get("text_none") else "",
-                    state.get("subtitle", "") if not state.get("text_none") else "",
-                    filter_name=state.get("filter", "original"),
-                    font_style=state.get("font", "mem"),
-                    position=state.get("position", "center"),
-                )
-                result.seek(0)
-                tg_send_photo(
-                    chat_id,
-                    result.read(),
-                    caption=f"Готово! ({_settings_summary(state)})\n\nОтправь фото снова, чтобы сделать ещё одно.",
-                )
-                clear_store(chat_id, user_id)
+                _render_and_send(chat_id, user_id, state)
             except Exception as e:
                 logging.exception("Ошибка обработки фото")
                 tg_send_message(chat_id, f"Ошибка обработки: {e}")
+            return "OK"
+
+        # Перегенерация: следующий стиль по кругу
+        if data == "reroll":
+            counter = state.get("rr", 0) + 1
+            state.update(_combo_at(counter))
+            state["rr"] = counter
+            set_store(chat_id, state, user_id)
+            try:
+                _render_and_send(chat_id, user_id, state)
+            except Exception as e:
+                logging.exception("Ошибка перегенерации")
+                tg_send_message(chat_id, f"Ошибка: {e}")
+            return "OK"
+
+        # Случайный стиль: из панели — обновить, из фото — сразу рендер
+        if data == "random":
+            state.update(_random_combo())
+            set_store(chat_id, state, user_id)
+            if state.get("rendered"):
+                try:
+                    _render_and_send(chat_id, user_id, state)
+                except Exception as e:
+                    logging.exception("Ошибка случайного стиля")
+                    tg_send_message(chat_id, f"Ошибка: {e}")
+            else:
+                show_panel(chat_id, user_id, state, view="root")
+            return "OK"
+
+        # Сохранить текущий результат
+        if data == "keep":
+            clear_store(chat_id, user_id)
+            tg_send_message(
+                chat_id,
+                "Готово! Отправь фото снова, чтобы сделать ещё одно.",
+            )
             return "OK"
 
         # Навигация между разделами
@@ -632,7 +788,13 @@ def webhook():
             return "OK"
 
         # Выбор значения внутри раздела (set:filter:X и т.п.)
-        for prefix, options in (("filter", FILTERS), ("font", FONTS), ("position", POSITIONS)):
+        for prefix, options in (
+            ("filter", FILTERS),
+            ("font", FONTS),
+            ("position", POSITIONS),
+            ("frame", FRAMES),
+            ("tstyle", TEXT_STYLES),
+        ):
             if data.startswith(f"set:{prefix}:"):
                 value = data.split(":", 2)[2]
                 if value in options:
