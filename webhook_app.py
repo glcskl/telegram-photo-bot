@@ -194,6 +194,40 @@ def tg_send_photo(chat_id, photo_bytes, caption=""):
         return None
 
 
+def tg_edit_message(chat_id, message_id, text=None, reply_markup=None):
+    """Редактирует существующее сообщение (текст и/или клавиатуру)."""
+    method = "editMessageText" if text else "editMessageReplyMarkup"
+    payload = {"chat_id": chat_id, "message_id": message_id}
+    if text:
+        payload["text"] = text
+    if reply_markup:
+        payload["reply_markup"] = reply_markup
+    res = tg_request(method, payload)
+    if res and not res.get("ok"):
+        # "message is not modified" — содержимое не изменилось, это нормально
+        if "not modified" in (res.get("description") or ""):
+            return {"ok": True}
+    return res
+
+
+def show_panel(chat_id, user_id, state):
+    """Показывает/обновляет единую панель настроек. Возвращает id сообщения панели."""
+    text = _panel_text(state)
+    kb = _panel_keyboard(state)
+    msg_id = state.get("panel_msg_id")
+    if msg_id:
+        res = tg_edit_message(chat_id, msg_id, text=text, reply_markup=kb)
+        if res and res.get("ok"):
+            return msg_id
+    res = tg_send_message(chat_id, text, reply_markup=kb)
+    if res and res.get("ok") and res["result"].get("message_id"):
+        new_id = res["result"]["message_id"]
+        state["panel_msg_id"] = new_id
+        set_store(chat_id, state, user_id)
+        return new_id
+    return None
+
+
 # Опции настройки изображения
 FILTERS = {
     "original": "Оригинал",
@@ -215,66 +249,48 @@ POSITIONS = {
 }
 
 
-def _keyboard(options: dict, prefix: str, current: str = "") -> dict:
-    """Строит inline-клавиатуру из словаря {ключ: подпись}, текущий выбор помечен галочкой."""
-    buttons = []
-    for key, label in options.items():
-        mark = " ✓" if key == current else ""
-        buttons.append({"text": f"{label}{mark}", "callback_data": f"{prefix}:{key}"})
-    return {"inline_keyboard": [buttons[i : i + 2] for i in range(0, len(buttons), 2)]}
+def _option_row(options: dict, prefix: str, current: str) -> list:
+    buttons = [
+        {"text": f"{label} ✓" if key == current else f"{label}", "callback_data": f"{prefix}:{key}"}
+        for key, label in options.items()
+    ]
+    return buttons
 
 
-def _nav_keyboard() -> dict:
-    """Кнопки навигации по шагам настройки."""
+def _panel_keyboard(state: dict) -> dict:
+    """Единая клавиатура-панель: все настройки сразу, текущие помечены галочкой."""
     return {
         "inline_keyboard": [
-            [
-                {"text": "Фильтр", "callback_data": "nav:filter"},
-                {"text": "Шрифт", "callback_data": "nav:font"},
-                {"text": "Позиция", "callback_data": "nav:position"},
-            ],
+            _option_row(FILTERS, "filter", state.get("filter", "original")),
+            _option_row(FONTS, "font", state.get("font", "mem")),
+            _option_row(POSITIONS, "position", state.get("position", "center")),
             [{"text": "Сделать фото", "callback_data": "render"}],
         ]
     }
 
 
-def _settings_summary(state: dict) -> str:
-    """Человекочитаемая сводка текущих настроек."""
-    f = state.get("filter", "original")
-    fo = state.get("font", "mem")
-    pos = state.get("position", "center")
+def _panel_text(state: dict) -> str:
+    """Текст панели: сводка настроек + текущий заголовок."""
     title = state.get("title", "")
     subtitle = state.get("subtitle", "")
-    lines = [
-        f"Фильтр: {FILTERS.get(f, f)}",
-        f"Шрифт: {FONTS.get(fo, fo)}",
-        f"Позиция: {POSITIONS.get(pos, pos)}",
+    text = [
+        "Настройки:",
+        f"Фильтр: {FILTERS.get(state.get('filter', 'original'), '')}",
+        f"Шрифт: {FONTS.get(state.get('font', 'mem'), '')}",
+        f"Позиция: {POSITIONS.get(state.get('position', 'center'), '')}",
         "",
         f"Заголовок: {title}",
     ]
     if subtitle:
-        lines.append(f"Подзаголовок: {subtitle}")
-    return "\n".join(lines)
+        text.append(f"Подзаголовок: {subtitle}")
+    text.append("")
+    text.append("Текущий выбор отмечен галочкой ✓")
+    return "\n".join(text)
 
 
-def _step_prompt(step: str, state: dict) -> tuple[str, dict]:
-    """Возвращает (текст, клавиатура) для запроса конкретного шага."""
-    if step == "filter":
-        return (
-            "Выбери фильтр:",
-            _keyboard(FILTERS, "filter", state.get("filter", "original")),
-        )
-    if step == "font":
-        return (
-            "Выбери шрифт:",
-            _keyboard(FONTS, "font", state.get("font", "mem")),
-        )
-    if step == "position":
-        return (
-            "Выбери расположение текста:",
-            _keyboard(POSITIONS, "position", state.get("position", "center")),
-        )
-    return "", {}
+def _settings_summary(state: dict) -> str:
+    """Краткая сводка для подписи результата (без заголовка)."""
+    return f"{FILTERS.get(state.get('filter', 'original'))} | {FONTS.get(state.get('font', 'mem'))} | {POSITIONS.get(state.get('position', 'center'))}"
 
 
 def _is_supported_image(data: bytes) -> bool:
@@ -421,14 +437,10 @@ def webhook():
 
             state["title"] = title
             state["subtitle"] = subtitle
+            state["panel_msg_id"] = None  # сброс: новое фото = новая панель
             set_store(chat_id, state, user_id)
 
-            tg_send_message(
-                chat_id,
-                f"{_settings_summary(state)}\n\n"
-                "Настрой как хочешь и жми «Сделать фото»:",
-                reply_markup=_nav_keyboard(),
-            )
+            show_panel(chat_id, user_id, state)
             return "OK"
 
     # Обработка нажатия кнопки
@@ -458,7 +470,7 @@ def webhook():
                 tg_send_photo(
                     chat_id,
                     result.read(),
-                    caption="Готово! Отправь фото снова, чтобы сделать ещё одно.",
+                    caption=f"Готово! ({_settings_summary(state)})\n\nОтправь фото снова, чтобы сделать ещё одно.",
                 )
                 clear_store(chat_id, user_id)
             except Exception as e:
@@ -466,32 +478,14 @@ def webhook():
                 tg_send_message(chat_id, f"Ошибка обработки: {e}")
             return "OK"
 
-        # Навигация: показать выбор конкретного шага
-        if data.startswith("nav:"):
-            step = data.split(":", 1)[1]
-            text, kb = _step_prompt(step, state)
-            if text:
-                # Показываем сводку + запрос шага
-                tg_send_message(
-                    chat_id,
-                    f"{_settings_summary(state)}\n\n{text}",
-                    reply_markup=kb,
-                )
-            return "OK"
-
-        # Установка значения шага (filter/font/position) — возвращаемся к сводке
+        # Единая панель: установка значения и обновление той же клавиатуры
         for prefix, options in (("filter", FILTERS), ("font", FONTS), ("position", POSITIONS)):
             if data.startswith(f"{prefix}:"):
                 value = data.split(":", 1)[1]
                 if value in options:
                     state[prefix] = value
                     set_store(chat_id, state, user_id)
-                    tg_send_message(
-                        chat_id,
-                        f"{_settings_summary(state)}\n\n"
-                        "Настрой как хочешь и жми «Сделать фото»:",
-                        reply_markup=_nav_keyboard(),
-                    )
+                    show_panel(chat_id, user_id, state)
                 return "OK"
 
         return "OK"
