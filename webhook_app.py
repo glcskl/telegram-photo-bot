@@ -210,19 +210,21 @@ def tg_edit_message(chat_id, message_id, text=None, reply_markup=None):
     return res
 
 
-def show_panel(chat_id, user_id, state):
-    """Показывает/обновляет единую панель настроек. Возвращает id сообщения панели."""
-    text = _panel_text(state)
-    kb = _panel_keyboard(state)
+def show_panel(chat_id, user_id, state, view="root"):
+    """Показывает/обновляет панель настроек для раздела view. Возвращает id сообщения."""
+    is_group = chat_id < 0
+    text, kb = _panel_view(state, view, is_group)
     msg_id = state.get("panel_msg_id")
     if msg_id:
         res = tg_edit_message(chat_id, msg_id, text=text, reply_markup=kb)
         if res and res.get("ok"):
+            state["panel_view"] = view
             return msg_id
     res = tg_send_message(chat_id, text, reply_markup=kb)
     if res and res.get("ok") and res["result"].get("message_id"):
         new_id = res["result"]["message_id"]
         state["panel_msg_id"] = new_id
+        state["panel_view"] = view
         set_store(chat_id, state, user_id)
         return new_id
     return None
@@ -250,47 +252,145 @@ POSITIONS = {
 
 
 def _option_row(options: dict, prefix: str, current: str) -> list:
-    buttons = [
-        {"text": f"{label} ✓" if key == current else f"{label}", "callback_data": f"{prefix}:{key}"}
+    """Ряд кнопок выбора, текущая помечена галочкой. callback: set:<раздел>:<ключ>"""
+    return [
+        {
+            "text": f"{label} ✓" if key == current else label,
+            "callback_data": f"set:{prefix}:{key}",
+        }
         for key, label in options.items()
     ]
-    return buttons
 
 
-def _panel_keyboard(state: dict) -> dict:
-    """Единая клавиатура-панель: все настройки сразу, текущие помечены галочкой."""
-    return {
-        "inline_keyboard": [
-            _option_row(FILTERS, "filter", state.get("filter", "original")),
-            _option_row(FONTS, "font", state.get("font", "mem")),
-            _option_row(POSITIONS, "position", state.get("position", "center")),
-            [{"text": "Сделать фото", "callback_data": "render"}],
-        ]
-    }
+def _nav_row() -> list:
+    """Кнопки «Хелп» и «Назад» для разделов."""
+    return [
+        {"text": "Хелп", "callback_data": "view:help"},
+        {"text": "Назад", "callback_data": "view:root"},
+    ]
 
 
-def _panel_text(state: dict) -> str:
-    """Текст панели: сводка настроек + текущий заголовок."""
+def _text_line(state: dict) -> str:
+    """Строка текущего текста."""
+    if state.get("text_none"):
+        return "Без текста"
     title = state.get("title", "")
     subtitle = state.get("subtitle", "")
-    text = [
-        "Настройки:",
-        f"Фильтр: {FILTERS.get(state.get('filter', 'original'), '')}",
-        f"Шрифт: {FONTS.get(state.get('font', 'mem'), '')}",
-        f"Позиция: {POSITIONS.get(state.get('position', 'center'), '')}",
-        "",
-        f"Заголовок: {title}",
-    ]
-    if subtitle:
-        text.append(f"Подзаголовок: {subtitle}")
-    text.append("")
-    text.append("Текущий выбор отмечен галочкой ✓")
-    return "\n".join(text)
+    if not title:
+        return "Текст не задан"
+    return f"{title} | {subtitle}" if subtitle else title
+
+
+def _settings_line(state: dict) -> str:
+    """Одна строка: фильтр | шрифт | позиция."""
+    return (
+        f"{FILTERS.get(state.get('filter', 'original'))} | "
+        f"{FONTS.get(state.get('font', 'mem'))} | "
+        f"{POSITIONS.get(state.get('position', 'center'))}"
+    )
+
+
+def _help_text(is_group: bool) -> str:
+    """Справка про бота для режима чата (группа или ЛС)."""
+    base = (
+        "Что умеет бот:\n"
+        "Накладывает текст на фото с выбором оформления.\n\n"
+        "Как пользоваться:\n"
+        "1. Отправь фото\n"
+        "2. Введи текст (можно «Заголовок | Подзаголовок»)\n"
+        "   или нажми «Без текста» — чтобы сделать фото без надписи\n"
+        "3. В меню настройки открой разделы:\n"
+        "   - Фильтры: Оригинал, Сепия, Ч/Б, Винтаж, Неон\n"
+        "   - Шрифты: Мем, Официальный, Современный\n"
+        "   - Позиция: Сверху, Центр, Снизу, Мем-стиль\n"
+        "   - Текст: изменить или убрать текст\n"
+        "4. Нажми «Готово» — получишь фото\n\n"
+    )
+    if is_group:
+        return (
+            base
+            + f"В групповом чате бот работает по триггеру:\n"
+            f"напиши «кот» или упомяни @{BOT_USERNAME} — и дальше\n"
+            f"отправляй фото. Без триггера бот молчит в группе.\n\n"
+            f"Команды: /help, /reset"
+        )
+    return base + "Команды: /help, /reset"
+
+
+def _panel_view(state: dict, view: str, is_group: bool) -> tuple[str, dict]:
+    """Возвращает (текст, клавиатура) для экрана панели по имени view."""
+    if view == "help":
+        return (
+            _help_text(is_group),
+            {"inline_keyboard": [[{"text": "Понятно", "callback_data": "view:root"}]]},
+        )
+
+    if view == "root":
+        text = (
+            "Настройки.\n\n"
+            f"Текст: {_text_line(state)}\n"
+            f"{_settings_line(state)}\n\n"
+            "Выбери раздел для настройки или жми «Готово»:"
+        )
+        kb = {
+            "inline_keyboard": [
+                [
+                    {"text": "Фильтры", "callback_data": "view:filter"},
+                    {"text": "Шрифты", "callback_data": "view:font"},
+                ],
+                [
+                    {"text": "Текст", "callback_data": "view:text"},
+                    {"text": "Позиция", "callback_data": "view:position"},
+                ],
+                [
+                    {"text": "Хелп", "callback_data": "view:help"},
+                    {"text": "Готово", "callback_data": "render"},
+                ],
+            ]
+        }
+        return text, kb
+
+    if view in ("filter", "font", "position"):
+        options = {"filter": FILTERS, "font": FONTS, "position": POSITIONS}[view]
+        labels = {
+            "filter": "Фильтр",
+            "font": "Шрифт",
+            "position": "Позиция текста",
+        }
+        cur = state.get(view, {"filter": "original", "font": "mem", "position": "center"}[view])
+        text = (
+            f"Раздел: {labels[view]}\n\n"
+            f"Текущий: {options.get(cur, cur)}\n"
+            "Нажми свой вариант (галочка = выбран):"
+        )
+        kb = {
+            "inline_keyboard": [
+                _option_row(options, view, cur),
+                _nav_row(),
+            ]
+        }
+        return text, kb
+
+    # view == "text"
+    text = (
+        "Раздел: Текст\n\n"
+        f"Текущий: {_text_line(state)}\n"
+        "Можно изменить или убрать текст:"
+    )
+    toggle_label = "Убрать текст" if not state.get("text_none") else "Показать текст"
+    kb = {
+        "inline_keyboard": [
+            [{"text": "Изменить текст", "callback_data": "txt:edit"}],
+            [{"text": toggle_label, "callback_data": "txt:none"}],
+            _nav_row(),
+        ]
+    }
+    return text, kb
 
 
 def _settings_summary(state: dict) -> str:
-    """Краткая сводка для подписи результата (без заголовка)."""
-    return f"{FILTERS.get(state.get('filter', 'original'))} | {FONTS.get(state.get('font', 'mem'))} | {POSITIONS.get(state.get('position', 'center'))}"
+    """Краткая сводка для подписи результата."""
+    return _settings_line(state)
 
 
 def _is_supported_image(data: bytes) -> bool:
@@ -337,6 +437,21 @@ def webhook():
         #  - пока сессия активна — обрабатывает фото/заголовки
         #  - после результата сессия закрывается, снова ждёт «кот»
         chat_type = msg.get("chat", {}).get("type", "private")
+        is_group = chat_id < 0
+
+        # Команды /start и /help доступны всегда (в том числе в группе)
+        if "text" in msg and msg["text"].strip() == "/start":
+            tg_send_message(
+                chat_id,
+                "Привет! Я накладываю текст на фото.\n"
+                "Отправь фото — дальше будет просто.\n\n"
+                "Подробнее: /help",
+            )
+            return "OK"
+
+        if "text" in msg and msg["text"].strip() == "/help":
+            tg_send_message(chat_id, _help_text(is_group))
+            return "OK"
 
         # Сброс сессии по команде /reset
         if "text" in msg and msg["text"].strip() == "/reset":
@@ -375,11 +490,6 @@ def webhook():
             state = get_store(chat_id, user_id)
             state.setdefault("active", True)
 
-        # Команда /start — приветствие, только если не в группе (в группе нужен триггер)
-        if "text" in msg and msg["text"] == "/start":
-            tg_send_message(chat_id, "Привет! Отправь фото, я красиво оформлю заголовок.")
-            return "OK"
-
         # Обработка фото
         if "photo" in msg:
             photo = msg["photo"][-1]
@@ -409,13 +519,21 @@ def webhook():
             current.setdefault("filter", "original")
             current.setdefault("font", "mem")
             current.setdefault("position", "center")
+            current["panel_msg_id"] = None
+            current["text_mode"] = "initial"
+            current["text_none"] = False
             set_store(chat_id, current, user_id)
             tg_send_message(
                 chat_id,
                 "Фото получено!\n\n"
-                "Теперь напиши заголовок.\n"
-                "С подзаголовком можно через |:\n"
-                "`Название | Описание`",
+                "Теперь введи текст (например `Название | Описание`)\n"
+                "или нажми «Без текста», если текст не нужен:",
+                reply_markup={
+                    "inline_keyboard": [
+                        [{"text": "Без текста", "callback_data": "txt:none"}],
+                        [{"text": "Хелп", "callback_data": "view:help"}],
+                    ]
+                },
             )
             return "OK"
 
@@ -437,10 +555,13 @@ def webhook():
 
             state["title"] = title
             state["subtitle"] = subtitle
-            state["panel_msg_id"] = None  # сброс: новое фото = новая панель
+            state["text_none"] = False
+            mode = state.get("text_mode", "initial")
+            state["text_mode"] = None
             set_store(chat_id, state, user_id)
 
-            show_panel(chat_id, user_id, state)
+            # Если текст редактировался — возвращаемся в раздел Текст, иначе в корень
+            show_panel(chat_id, user_id, state, view="text" if mode == "edit" else "root")
             return "OK"
 
     # Обработка нажатия кнопки
@@ -460,8 +581,8 @@ def webhook():
             try:
                 result = process_image(
                     base64.b64decode(state["photo"]),
-                    state.get("title", ""),
-                    state.get("subtitle", ""),
+                    state.get("title", "") if not state.get("text_none") else "",
+                    state.get("subtitle", "") if not state.get("text_none") else "",
                     filter_name=state.get("filter", "original"),
                     font_style=state.get("font", "mem"),
                     position=state.get("position", "center"),
@@ -478,14 +599,46 @@ def webhook():
                 tg_send_message(chat_id, f"Ошибка обработки: {e}")
             return "OK"
 
-        # Единая панель: установка значения и обновление той же клавиатуры
+        # Навигация между разделами
+        if data.startswith("view:"):
+            view = data.split(":", 1)[1]
+            show_panel(chat_id, user_id, state, view=view)
+            return "OK"
+
+        # Редактировать текст
+        if data == "txt:edit":
+            state["text_mode"] = "edit"
+            set_store(chat_id, state, user_id)
+            tg_send_message(
+                chat_id,
+                "Введи новый текст для фото.\n"
+                "С подзаголовком можно через |:\n"
+                "`Название | Описание`",
+            )
+            return "OK"
+
+        # Включить/выключить текст
+        if data == "txt:none":
+            state["text_none"] = not state.get("text_none", False)
+            if state["text_none"]:
+                state["title"] = ""
+                state["subtitle"] = ""
+                state["text_mode"] = None
+            set_store(chat_id, state, user_id)
+            if state.get("panel_msg_id"):
+                show_panel(chat_id, user_id, state, view="text")
+            else:
+                show_panel(chat_id, user_id, state, view="root")
+            return "OK"
+
+        # Выбор значения внутри раздела (set:filter:X и т.п.)
         for prefix, options in (("filter", FILTERS), ("font", FONTS), ("position", POSITIONS)):
-            if data.startswith(f"{prefix}:"):
-                value = data.split(":", 1)[1]
+            if data.startswith(f"set:{prefix}:"):
+                value = data.split(":", 2)[2]
                 if value in options:
                     state[prefix] = value
                     set_store(chat_id, state, user_id)
-                    show_panel(chat_id, user_id, state)
+                    show_panel(chat_id, user_id, state, view=prefix)
                 return "OK"
 
         return "OK"
