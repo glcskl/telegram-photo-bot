@@ -136,36 +136,66 @@ def redis_del(key):
         logging.error(f"Redis del error: {e}")
 
 
-def get_store(chat_id):
+def state_key(chat_id, user_id):
+    """Ключ сессии: изолирует каждого пользователя даже в общем групповом чате."""
+    return f"user:{chat_id}:{user_id}"
+
+
+def get_store(chat_id, user_id=None):
     """Получить данные пользователя (photo, title, subtitle) из Redis."""
-    raw = redis_get(f"user:{chat_id}")
+    key = state_key(chat_id, user_id) if user_id else f"user:{chat_id}"
+    raw = redis_get(key)
     if not raw:
         return {}
     return json.loads(raw)
 
 
-def set_store(chat_id, data):
-    """Сохранить данные пользователя в Redis (TTL 1 час)."""
-    redis_setex(f"user:{chat_id}", json.dumps(data, ensure_ascii=False), ttl=3600)
+def set_store(chat_id, data, user_id=None):
+    """Сохранить данные пользователя в Redis (TTL 3 часа)."""
+    key = state_key(chat_id, user_id) if user_id else f"user:{chat_id}"
+    redis_setex(key, json.dumps(data, ensure_ascii=False), ttl=10800)
 
 
-def clear_store(chat_id):
-    redis_del(f"user:{chat_id}")
+def clear_store(chat_id, user_id=None):
+    key = state_key(chat_id, user_id) if user_id else f"user:{chat_id}"
+    redis_del(key)
+
+
+def tg_request(method, payload):
+    try:
+        resp = requests.post(f"{TELEGRAM_API}/{method}", json=payload, timeout=20)
+        result = resp.json()
+        if not result.get("ok"):
+            logging.error(
+                f"[TG:{method}] ошибка: {result.get('description')} payload={payload}"
+            )
+        return result
+    except Exception as e:
+        logging.error(f"[TG:{method}] exception: {e}")
+        return None
 
 
 def tg_send_message(chat_id, text, reply_markup=None):
     payload = {"chat_id": chat_id, "text": text}
     if reply_markup:
         payload["reply_markup"] = reply_markup
-    requests.post(f"{TELEGRAM_API}/sendMessage", json=payload)
+    return tg_request("sendMessage", payload)
 
 
 def tg_send_photo(chat_id, photo_bytes, caption=""):
-    requests.post(
-        f"{TELEGRAM_API}/sendPhoto",
-        data={"chat_id": chat_id, "caption": caption},
-        files={"photo": ("photo.jpg", photo_bytes, "image/jpeg")},
-    )
+    try:
+        resp = requests.post(
+            f"{TELEGRAM_API}/sendPhoto",
+            data={"chat_id": chat_id, "caption": caption},
+            files={"photo": ("photo.jpg", photo_bytes, "image/jpeg")},
+        )
+        result = resp.json()
+        if not result.get("ok"):
+            logging.error(f"[TG:sendPhoto] ошибка: {result.get('description')}")
+        return result
+    except Exception as e:
+        logging.error(f"[TG:sendPhoto] exception: {e}")
+        return None
 
 
 def build_mode_keyboard():
@@ -178,6 +208,15 @@ def build_mode_keyboard():
             ]
         ]
     }
+
+
+def _is_supported_image(data: bytes) -> bool:
+    """Проверка формата изображения по сигнатуре (JPEG/PNG/WebP)."""
+    return (
+        data.startswith(b"\xff\xd8\xff")  # JPEG
+        or data.startswith(b"\x89PNG\r\n\x1a\n")  # PNG
+        or data.startswith(b"RIFF") and data[8:12] == b"WEBP"  # WebP
+    )
 
 
 @app.route("/", methods=["GET"])
@@ -204,17 +243,26 @@ def webhook():
     # Команда /start
     if "message" in update:
         msg = update["message"]
+        from_user = msg.get("from", {})
+        user_id = from_user.get("id")
         chat_id = msg["chat"]["id"]
         text_content = f"{msg.get('text', '')} {msg.get('caption', '')}"
+        bot_mention = f"@{BOT_USERNAME}".lower()
 
         # В групповых чатах бот работает по шаблону:
         #  - ждёт триггер «кот» или @упоминание -> открывает сессию
         #  - пока сессия активна — обрабатывает фото/заголовки
         #  - после результата сессия закрывается, снова ждёт «кот»
         chat_type = msg.get("chat", {}).get("type", "private")
+
+        # Сброс сессии по команде /reset
+        if "text" in msg and msg["text"].strip() == "/reset":
+            if user_id is not None:
+                clear_store(chat_id, user_id)
+            tg_send_message(chat_id, "Сессия сброшена. Скажи «кот», чтобы начать заново.")
+            return "OK"
+
         if chat_type in ("group", "supergroup"):
-            is_private = False
-            bot_mention = f"@{BOT_USERNAME}".lower()
             lowercase_text = text_content.lower()
             triggered = (
                 ("кот" in lowercase_text or bot_mention in lowercase_text)
@@ -224,7 +272,7 @@ def webhook():
                     for ent in msg.get("entities", [])
                 )
             )
-            state = get_store(chat_id)
+            state = get_store(chat_id, user_id)
             session_active = bool(state and state.get("active"))
 
             # Нет триггера и нет активной сессии -> молчим
@@ -233,7 +281,7 @@ def webhook():
 
             # Триггер есть, сессия ещё не открыта -> открываем
             if triggered and not session_active:
-                set_store(chat_id, {"active": True})
+                set_store(chat_id, {"active": True}, user_id)
                 tg_send_message(chat_id, "Мяу! Пришли фото, я сделаю красивое оформление.")
                 return "OK"
 
@@ -241,7 +289,8 @@ def webhook():
             state = state or {}
             state.setdefault("active", True)
         else:
-            is_private = True
+            state = get_store(chat_id, user_id)
+            state.setdefault("active", True)
 
         # Команда /start — приветствие, только если не в группе (в группе нужен триггер)
         if "text" in msg and msg["text"] == "/start":
@@ -253,23 +302,36 @@ def webhook():
             photo = msg["photo"][-1]
             file_id = photo["file_id"]
             # Скачиваем файл
-            f = requests.get(f"{TELEGRAM_API}/getFile", params={"file_id": file_id}).json()
+            f = tg_request("getFile", {"file_id": file_id})
+            if not f or not f.get("ok"):
+                tg_send_message(chat_id, "Не удалось получить фото. Попробуй ещё раз.")
+                return "OK"
             file_path = f["result"]["file_path"]
+            file_size = f["result"].get("file_size", 0)
+            if file_size > 20 * 1024 * 1024:
+                tg_send_message(chat_id, "Фото слишком большое (лимит 20 МБ).")
+                return "OK"
             photo_url = f"https://api.telegram.org/file/bot{TOKEN}/{file_path}"
             photo_bytes = requests.get(photo_url).content
-            current = get_store(chat_id) or {}
+            if len(photo_bytes) > 20 * 1024 * 1024:
+                tg_send_message(chat_id, "Фото слишком большое (лимит 20 МБ).")
+                return "OK"
+            # Валидация: это должно быть изображение JPEG/PNG/WebP
+            if not _is_supported_image(photo_bytes):
+                tg_send_message(chat_id, "Это не похоже на изображение (JPEG/PNG/WebP). Попробуй другое фото.")
+                return "OK"
+            current = get_store(chat_id, user_id) or {}
             current.setdefault("active", True)
             current["photo"] = base64.b64encode(photo_bytes).decode()
-            set_store(chat_id, current)
+            set_store(chat_id, current, user_id)
             tg_send_message(chat_id, "Фото получено! Теперь напиши заголовок.\nМожно с подзаголовком через |")
             return "OK"
 
         # Обработка текста (заголовок)
         if "text" in msg:
-            uid = chat_id
-            state = get_store(uid)
+            state = get_store(chat_id, user_id)
             if not state or "photo" not in state:
-                tg_send_message(uid, "Сначала отправь мне фото.")
+                tg_send_message(chat_id, "Сначала отправь мне фото.")
                 return "OK"
 
             text = msg["text"]
@@ -283,10 +345,10 @@ def webhook():
 
             state["title"] = title
             state["subtitle"] = subtitle
-            set_store(uid, state)
+            set_store(chat_id, state, user_id)
 
             tg_send_message(
-                uid,
+                chat_id,
                 f"Заголовок: **{title}**" + (f"\nПодзаголовок: {subtitle}" if subtitle else ""),
                 reply_markup=build_mode_keyboard(),
             )
@@ -295,13 +357,15 @@ def webhook():
     # Обработка нажатия кнопки
     if "callback_query" in update:
         cq = update["callback_query"]
-        uid = cq["message"]["chat"]["id"]
+        chat_id = cq["message"]["chat"]["id"]
+        cb_from = cq.get("from", {})
+        user_id = cb_from.get("id")
         data = cq["data"]
         mode = data.split(":")[1]
 
-        state = get_store(uid)
+        state = get_store(chat_id, user_id)
         if not state or "photo" not in state:
-            tg_send_message(uid, "Что-то пошло не так. Начни заново с фото.")
+            tg_send_message(chat_id, "Что-то пошло не так. Начни заново с фото.")
             return "OK"
 
         photo_bytes = base64.b64decode(state["photo"])
@@ -318,10 +382,11 @@ def webhook():
             processor = processors.get(mode)
             result = processor(photo_bytes, title, subtitle)
             result.seek(0)
-            tg_send_photo(uid, result.read(), caption=f"Готово! Стиль: {mode}")
-            clear_store(uid)
+            tg_send_photo(chat_id, result.read(), caption=f"Готово! Стиль: {mode}")
+            clear_store(chat_id, user_id)
         except Exception as e:
-            tg_send_message(uid, f"Ошибка обработки: {e}")
+            logging.exception("Ошибка обработки фото")
+            tg_send_message(chat_id, f"Ошибка обработки: {e}")
 
         return "OK"
 
